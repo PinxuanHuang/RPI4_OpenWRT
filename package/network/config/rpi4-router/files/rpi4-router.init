@@ -1,0 +1,7 @@
+#!/bin/sh /etc/rc.common
+# boot (10) has loaded drivers; configure before network (20) and dnsmasq (19).
+START=18
+
+start() {
+	/usr/libexec/rpi4-router-setup
+}

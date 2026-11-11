@@ -18,6 +18,7 @@ define Build/boot-common
 	echo $(IMG_PART_SIGNATURE) > $@-partuuid.txt
 	sed \
 		-e 's#@ROOT@#PARTUUID=$(IMG_PART_SIGNATURE)-02#g' \
+		$(if $(filter y,$(CONFIG_PACKAGE_rpi4-router)),-e 's/console=serial0$(comma)115200 *//g') \
 		cmdline.txt > $@-cmdline.txt
 
 	rm -f $@.boot

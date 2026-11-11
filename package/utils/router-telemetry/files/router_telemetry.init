@@ -1,0 +1,41 @@
+#!/bin/sh /etc/rc.common
+# procd service for OpenWrt router telemetry serial sender.
+START=95
+STOP=15
+USE_PROCD=1
+
+start_service() {
+    . /lib/functions.sh
+    config_load router_telemetry
+    local enabled iface device interval
+    config_get_bool enabled main enabled 0
+    [ "$enabled" = "1" ] || return 0
+    config_get iface main interface 'br-lan'
+    config_get device main device '/dev/ttyAMA0'
+    config_get interval main interval_ms '1000'
+
+    # Require explicitly configured UART, not a kernel/getty console.
+    case "$device" in
+        /dev/ttyAMA[0-9]*|/dev/ttyS[0-9]*|/dev/serial0) ;;
+        *) logger -t router_telemetry 'Unsupported serial device'; return 1 ;;
+    esac
+    [ -c "$device" ] || { logger -t router_telemetry "UART not found: $device"; return 1; }
+    if grep -Eq '(^| )console=(serial[0-9]+|ttyAMA[0-9]+|ttyS[0-9]+)(,| |$)' /proc/cmdline; then
+        logger -t router_telemetry 'Serial console still in kernel cmdline; service not started'
+        return 1
+    fi
+    # The sender retries missing interfaces, including a bridge still being
+    # created by netifd. Do not permanently skip startup during that race.
+
+    procd_open_instance
+    procd_set_param command /usr/sbin/router_telemetry_sender \
+        --interface "$iface" --device "$device" --interval-ms "$interval"
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 0
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+service_triggers() {
+    procd_add_reload_trigger router_telemetry
+}
