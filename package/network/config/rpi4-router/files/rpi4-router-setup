@@ -1,0 +1,150 @@
+#!/bin/sh
+# Adapted from the supplied wireless_router.sh for unattended first boot.
+set -e
+umask 077
+. /lib/functions/system.sh
+case "$(board_name)" in
+    raspberrypi,4-model-b|raspberrypi,400|raspberrypi,4-compute-module) ;;
+    *) exit 0 ;;
+esac
+[ "$(uci -q get rpi4_router.main.configured || :)" = 1 ] && exit 0
+
+SSID=$(uci -q get rpi4_router.main.ssid)
+COUNTRY=$(uci -q get rpi4_router.main.country)
+RADIO=$(uci -q get rpi4_router.main.radio)
+WIFI_PASSWORD=$(uci -q get rpi4_router.main.key)
+LAN_IP=192.168.88.1
+fail() { logger -t rpi4-router "$1"; echo "$1" >&2; exit 1; }
+[ "${#SSID}" -ge 1 ] && [ "${#SSID}" -le 32 ] || fail 'Invalid Wi-Fi SSID'
+case "$COUNTRY" in [A-Z][A-Z]) ;; *) fail 'Invalid Wi-Fi country' ;; esac
+case "$RADIO" in radio[0-9]*) ;; *) fail 'Invalid Wi-Fi radio' ;; esac
+[ "${#WIFI_PASSWORD}" -ge 8 ] && [ "${#WIFI_PASSWORD}" -le 63 ] ||
+    fail 'Set an 8..63 character key in /etc/config/rpi4_router before setup'
+case "$WIFI_PASSWORD" in *[!\ -~]*) fail 'Wi-Fi key must be printable ASCII' ;; esac
+[ -d /sys/class/net/eth0 ] || fail 'eth0 not found'
+# Drivers have been loaded by S10boot. Detect the actual radio path now.
+/sbin/wifi config
+uci -q get "wireless.${RADIO}.type" >/dev/null || fail 'Wi-Fi radio not detected; retry after driver initialization'
+for config in network wireless dhcp firewall router_telemetry; do
+    [ -r "/etc/config/$config" ] || fail "Missing /etc/config/$config"
+done
+BACKUP_DIR=/root/router-config-before-firstboot
+mkdir -p "$BACKUP_DIR"
+for config in network wireless dhcp firewall router_telemetry; do
+    [ -e "$BACKUP_DIR/$config" ] || cp -p "/etc/config/$config" "$BACKUP_DIR/$config"
+done
+
+find_section() {
+    # $1=UCI package, $2=section type, $3=option, $4=value
+    pkg=$1 kind=$2 attr=$3 expected=$4
+    for sec in $(uci -q show "$pkg" | sed -n "s/^\\(${pkg}\\.[^.]*\\)=${kind}\$/\\1/p"); do
+        value=$(uci -q get "$sec.$attr" 2>/dev/null || :)
+        if [ "$value" = "$expected" ]; then
+            printf '%s\n' "$sec"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Remove eth0 from the existing br-lan device, then keep the empty bridge
+# created before its Wi-Fi-only AP gets added by netifd (bridge_empty=1).
+bridge_section=$(find_section network device name br-lan || :)
+if [ -z "$bridge_section" ]; then
+    bridge_section=network.router_lan_bridge
+    uci set "$bridge_section=device"
+fi
+uci set "$bridge_section.name=br-lan"
+uci set "$bridge_section.type=bridge"
+uci -q delete "$bridge_section.ports" || :
+uci set "$bridge_section.bridge_empty=1"
+
+uci set network.wan=interface
+uci set network.wan.device=eth0
+uci set network.wan.proto=dhcp
+uci set network.lan=interface
+uci -q delete network.lan.type || :
+uci set network.lan.device=br-lan
+uci set network.lan.proto=static
+uci -q delete network.lan.ipaddr || :
+uci set network.lan.ipaddr="$LAN_IP"
+uci set network.lan.netmask=255.255.255.0
+uci -q delete network.lan.gateway || :
+uci -q delete network.lan.dns || :
+uci -q delete network.lan.ip6assign || :
+
+uci set dhcp.lan=dhcp
+uci set dhcp.lan.interface=lan
+uci set dhcp.lan.ignore=0
+uci set dhcp.lan.dhcpv4=server
+uci set dhcp.lan.start=100
+uci set dhcp.lan.limit=100
+uci set dhcp.lan.leasetime=12h
+uci set dhcp.lan.dhcpv6=disabled
+uci set dhcp.lan.ra=disabled
+uci set dhcp.lan.ndp=disabled
+
+uci set "wireless.${RADIO}.disabled=0"
+uci set "wireless.${RADIO}.country=$COUNTRY"
+uci set "wireless.${RADIO}.band=2g"
+uci set "wireless.${RADIO}.channel=6"
+uci set "wireless.${RADIO}.htmode=HT20"
+uci -q get "wireless.default_${RADIO}" >/dev/null 2>&1 &&
+    uci set "wireless.default_${RADIO}.disabled=1" || :
+uci set wireless.ap_main=wifi-iface
+uci set wireless.ap_main.device="$RADIO"
+uci set wireless.ap_main.mode=ap
+uci set wireless.ap_main.network=lan
+uci set wireless.ap_main.ssid="$SSID"
+uci set wireless.ap_main.encryption=psk2
+uci set wireless.ap_main.key="$WIFI_PASSWORD"
+uci set wireless.ap_main.disabled=0
+WIFI_PASSWORD=
+
+# Match zones by their name, never assume anonymous @zone[] ordering.
+lan_zone=$(find_section firewall zone name lan || :)
+wan_zone=$(find_section firewall zone name wan || :)
+if [ -z "$lan_zone" ]; then lan_zone=firewall.router_lan_zone; uci set "$lan_zone=zone"; fi
+if [ -z "$wan_zone" ]; then wan_zone=firewall.router_wan_zone; uci set "$wan_zone=zone"; fi
+uci set "$lan_zone.name=lan"
+uci -q delete "$lan_zone.network" || :
+uci add_list "$lan_zone.network=lan"
+uci set "$lan_zone.input=ACCEPT"
+uci set "$lan_zone.output=ACCEPT"
+uci set "$lan_zone.forward=ACCEPT"
+uci set "$wan_zone.name=wan"
+uci -q delete "$wan_zone.network" || :
+uci add_list "$wan_zone.network=wan"
+uci set "$wan_zone.input=REJECT"
+uci set "$wan_zone.output=ACCEPT"
+uci set "$wan_zone.forward=REJECT"
+uci set "$wan_zone.masq=1"
+uci set "$wan_zone.mtu_fix=1"
+
+# Ensure LAN->WAN forwarding exists without duplicating an existing rule.
+found=0
+for fwd in $(uci -q show firewall | sed -n 's/^\(firewall\.[^.]*\)=forwarding$/\1/p'); do
+    src=$(uci -q get "$fwd.src" || :)
+    dst=$(uci -q get "$fwd.dest" || :)
+    if [ "$src" = lan ] && [ "$dst" = wan ]; then found=1; break; fi
+done
+if [ "$found" = 0 ]; then
+    uci set firewall.router_lan_to_wan=forwarding
+    uci set firewall.router_lan_to_wan.src=lan
+    uci set firewall.router_lan_to_wan.dest=wan
+fi
+
+# Set telemetry up only in the dedicated router profile.
+uci set router_telemetry.main.enabled=1
+uci set router_telemetry.main.device=/dev/ttyAMA0
+uci set router_telemetry.main.interface=br-lan
+for config in network wireless dhcp firewall router_telemetry; do
+    uci commit "$config"
+done
+chmod 0600 /etc/config/wireless /etc/config/rpi4_router
+# netifd and ubus network objects do not exist yet; firewall starts normally
+# after network. Run fw4 check on the booted target, not in this early hook.
+uci set rpi4_router.main.configured=1
+uci commit rpi4_router
+logger -t rpi4-router 'Configured eth0 WAN, Wi-Fi LAN 192.168.88.1 and UART telemetry'
+exit 0
